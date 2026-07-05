@@ -1,0 +1,7 @@
+name: minimax
+version: 1.0.0
+description: MiniMax 开放平台 image-01 — text-to-image via api.minimaxi.com
+author: tony
+kind: backend
+requires_env:
+  - MINIMAX_API_KEY
