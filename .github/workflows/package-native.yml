@@ -1,0 +1,94 @@
+name: Native Linux bundle
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - "gateway/**"
+      - "hermes_cli/**"
+      - "plugins/**"
+      - "tools/**"
+      - "tui_gateway/**"
+      - "web/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/package-native.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Build native Linux source bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Use npm 12
+        run: npm i -g npm@12
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build Web UI
+        run: npm run --prefix web build
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install Python 3.11 and locked dependencies
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra dev
+
+      - name: Smoke test the built checkout
+        run: |
+          test -s hermes_cli/web_dist/index.html
+          uv run hermes --version
+          uv run python -m compileall -q agent gateway hermes_cli tools tui_gateway
+
+      - name: Assemble source bundle
+        env:
+          BUNDLE_ROOT: ${{ runner.temp }}/hermes-native
+          BUNDLE_FILE: ${{ runner.temp }}/hermes-agent-native-${{ github.sha }}.tar.gz
+        run: |
+          set -euo pipefail
+          mkdir -p "$BUNDLE_ROOT"
+          git archive --format=tar --prefix=hermes-agent/ "$GITHUB_SHA" \
+            | tar -xf - -C "$BUNDLE_ROOT"
+          cp -a hermes_cli/web_dist "$BUNDLE_ROOT/hermes-agent/hermes_cli/"
+          printf '%s\n' "$GITHUB_SHA" > "$BUNDLE_ROOT/hermes-agent/BUILD_SHA"
+          printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BUNDLE_ROOT/hermes-agent/BUILD_TIME_UTC"
+          printf '{"commit":"%s","platform":"linux-x86_64","python":"3.11"}\n' \
+            "$GITHUB_SHA" > "$BUNDLE_ROOT/hermes-agent/bundle-manifest.json"
+          tar -C "$BUNDLE_ROOT" -czf "$BUNDLE_FILE" hermes-agent
+          sha256sum "$BUNDLE_FILE" | tee "$BUNDLE_FILE.sha256"
+
+      - name: Upload native bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-native-linux-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/hermes-agent-native-${{ github.sha }}.tar.gz
+            ${{ runner.temp }}/hermes-agent-native-${{ github.sha }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
