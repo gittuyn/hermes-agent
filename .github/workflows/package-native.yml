@@ -81,7 +81,10 @@ jobs:
           printf '{"commit":"%s","platform":"linux-x86_64","python":"3.11"}\n' \
             "$GITHUB_SHA" > "$BUNDLE_ROOT/hermes-agent/bundle-manifest.json"
           tar -C "$BUNDLE_ROOT" -czf "$BUNDLE_FILE" hermes-agent
-          sha256sum "$BUNDLE_FILE" | tee "$BUNDLE_FILE.sha256"
+          (
+            cd "$(dirname "$BUNDLE_FILE")"
+            sha256sum "$(basename "$BUNDLE_FILE")" | tee "$(basename "$BUNDLE_FILE").sha256"
+          )
 
       - name: Upload native bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
