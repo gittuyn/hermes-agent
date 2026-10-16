@@ -130,6 +130,9 @@ env:
 jobs:
   pick-releases:
     name: Pick release tags
+    # Forks do not inherit the upstream release tags this workflow samples.
+    # Keep this release-only workflow active only in the canonical repository.
+    if: github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:

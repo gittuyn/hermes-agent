@@ -1,5 +1,6 @@
 """Tests for DingTalk platform adapter."""
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -94,6 +95,19 @@ class TestDingTalkRequirements:
         from plugins.platforms.dingtalk.adapter import check_dingtalk_requirements
         assert check_dingtalk_requirements() is False
 
+    def test_robot_code_comes_from_its_own_setting(self, monkeypatch):
+        monkeypatch.setattr(
+            "plugins.platforms.dingtalk.adapter._get_scoped_secret",
+            lambda name, default="": {
+                "DINGTALK_CLIENT_ID": "test-app",
+                "DINGTALK_CLIENT_SECRET": "test-secret",
+                "DINGTALK_ROBOT_CODE": "test-robot-code",
+            }.get(name, default),
+        )
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        assert adapter._robot_code == "test-robot-code"
+
 # ---------------------------------------------------------------------------
 # Adapter construction
 # ---------------------------------------------------------------------------
@@ -107,6 +121,48 @@ class TestDingTalkRequirements:
 # ---------------------------------------------------------------------------
 
 class TestSend:
+
+    @pytest.mark.asyncio
+    async def test_send_without_robot_code_fails_before_openapi_call(self, monkeypatch):
+        monkeypatch.setattr(
+            "plugins.platforms.dingtalk.adapter._get_scoped_secret",
+            lambda _name, default="": default,
+        )
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True, extra={"client_id": "test-app"}))
+        adapter._get_access_token = AsyncMock(return_value="must-not-be-used")
+        adapter._http_client = AsyncMock()
+
+        result = await adapter.send("cid-test-group", "Hello!")
+
+        assert result.success is False
+        assert "DINGTALK_ROBOT_CODE" in result.error
+        adapter._get_access_token.assert_not_awaited()
+        adapter._http_client.post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_uses_openapi_when_session_webhook_is_unavailable(self, monkeypatch):
+        monkeypatch.setattr(
+            "plugins.platforms.dingtalk.adapter._get_scoped_secret",
+            lambda name, default="": "test-robot-code" if name == "DINGTALK_ROBOT_CODE" else default,
+        )
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True, extra={"client_id": "test-app"}))
+        adapter._get_access_token = AsyncMock(return_value="test-access-token")
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"processQueryKey": "queued"}
+        adapter._http_client = AsyncMock()
+        adapter._http_client.post = AsyncMock(return_value=mock_response)
+
+        result = await adapter.send("cid-test-group", "Hello!")
+
+        assert result.success is True
+        call = adapter._http_client.post.call_args
+        assert call.args[0] == "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+        assert call.kwargs["headers"] == {"x-acs-dingtalk-access-token": "test-access-token"}
+        assert call.kwargs["json"]["openConversationId"] == "cid-test-group"
+        assert call.kwargs["json"]["robotCode"] == "test-robot-code"
 
     @pytest.mark.asyncio
     async def test_send_posts_to_webhook(self):
@@ -157,6 +213,97 @@ class TestSend:
         payload = mock_client.post.call_args.kwargs["json"]
         assert payload["msgtype"] == "markdown"
         assert payload["markdown"]["text"] == "Screenshot\n\n![image](https://example.com/demo.png)"
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_uses_openapi_for_group_when_webhook_missing(self, monkeypatch):
+        import httpx
+        from plugins.platforms.dingtalk.adapter import _standalone_send
+
+        calls = []
+
+        class Response:
+            status_code = 200
+            text = "{}"
+
+            def __init__(self, body):
+                self._body = body
+
+            def json(self):
+                return self._body
+
+            def raise_for_status(self):
+                return None
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, url, **kwargs):
+                calls.append((url, kwargs))
+                if url.endswith("/oauth2/accessToken"):
+                    return Response({"accessToken": "test-access-token"})
+                return Response({"processQueryKey": "queued"})
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: Client())
+        monkeypatch.setattr(
+            "plugins.platforms.dingtalk.adapter._get_scoped_secret",
+            lambda name, default="": "test-robot-code" if name == "DINGTALK_ROBOT_CODE" else default,
+        )
+        config = PlatformConfig(
+            enabled=True,
+            extra={"client_id": "test-app", "client_secret": "test-secret"},
+        )
+
+        result = await _standalone_send(config, "cid-test-group", "Hello from cron")
+
+        assert result["success"] is True
+        assert calls[0] == (
+            "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+            {"json": {"appKey": "test-app", "appSecret": "test-secret"}},
+        )
+        send_url, send_kwargs = calls[1]
+        assert send_url == "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+        assert send_kwargs["headers"] == {"x-acs-dingtalk-access-token": "test-access-token"}
+        assert send_kwargs["json"]["robotCode"] == "test-robot-code"
+        assert send_kwargs["json"]["openConversationId"] == "cid-test-group"
+        assert send_kwargs["json"]["msgKey"] == "sampleText"
+        assert json.loads(send_kwargs["json"]["msgParam"]) == {"content": "Hello from cron"}
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_without_robot_code_fails_before_api_call(self, monkeypatch):
+        import httpx
+        from plugins.platforms.dingtalk.adapter import _standalone_send
+
+        calls = []
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, *args, **kwargs):
+                calls.append((args, kwargs))
+
+        monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: Client())
+        monkeypatch.setattr(
+            "plugins.platforms.dingtalk.adapter._get_scoped_secret",
+            lambda _name, default="": default,
+        )
+        config = PlatformConfig(
+            enabled=True,
+            extra={"client_id": "test-app", "client_secret": "test-secret"},
+        )
+
+        result = await _standalone_send(config, "cid-test-group", "Hello from cron")
+
+        assert "success" not in result
+        assert "DINGTALK_ROBOT_CODE" in result["error"]
+        assert calls == []
 
 # ---------------------------------------------------------------------------
 # Connect / disconnect

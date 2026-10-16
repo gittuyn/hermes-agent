@@ -1,0 +1,91 @@
+name: Native Linux bundle
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - "gateway/**"
+      - "hermes_cli/**"
+      - "plugins/**"
+      - "tools/**"
+      - "tui_gateway/**"
+      - "web/**"
+      - "ui-tui/**"
+      - "apps/shared/**"
+      - "scripts/build/**"
+      - "pm/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/package-native.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Build native Linux source bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install the locked Python and Node toolchains
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+
+      - name: Install JavaScript dependencies
+        run: node scripts/build/node-deps.mjs --source "$PWD" --workspace ui-tui --workspace web
+
+      - name: Build TUI
+        run: node scripts/build/tui.mjs
+
+      - name: Build Web UI
+        run: node scripts/build/web.mjs --source "$PWD" --icons "$PWD" --out "$PWD/hermes_cli/web_dist"
+
+      - name: Smoke test the built checkout
+        run: |
+          test -s hermes_cli/web_dist/index.html
+          test -s ui-tui/dist/entry.js
+          test "$(node scripts/build/freshness.mjs --source "$PWD" --product tui --out "$PWD/ui-tui/dist")" = true
+          test "$(node scripts/build/freshness.mjs --source "$PWD" --product web --out "$PWD/hermes_cli/web_dist")" = true
+          python -m compileall -q agent gateway hermes_cli tools tui_gateway plugins
+
+      - name: Assemble source bundle
+        env:
+          BUNDLE_ROOT: ${{ runner.temp }}/hermes-native
+          BUNDLE_FILE: ${{ runner.temp }}/hermes-agent-native-${{ github.sha }}.tar.gz
+        run: |
+          set -euo pipefail
+          mkdir -p "$BUNDLE_ROOT"
+          git archive --format=tar --prefix=hermes-agent/ "$GITHUB_SHA" \
+            | tar -xf - -C "$BUNDLE_ROOT"
+          cp -a hermes_cli/web_dist "$BUNDLE_ROOT/hermes-agent/hermes_cli/"
+          cp -a ui-tui/dist "$BUNDLE_ROOT/hermes-agent/ui-tui/"
+          printf '%s\n' "$GITHUB_SHA" > "$BUNDLE_ROOT/hermes-agent/BUILD_SHA"
+          printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BUNDLE_ROOT/hermes-agent/BUILD_TIME_UTC"
+          # Runtime dependencies stay managed by PM on the target; deployment
+          # must compare the Python and tool locks before reusing that environment.
+          printf '{"commit":"%s","platform":"linux-x86_64","python":"3.14","runtime":"existing-pm-environment"}\n' \
+            "$GITHUB_SHA" > "$BUNDLE_ROOT/hermes-agent/bundle-manifest.json"
+          tar -C "$BUNDLE_ROOT" -czf "$BUNDLE_FILE" hermes-agent
+          (
+            cd "$(dirname "$BUNDLE_FILE")"
+            sha256sum "$(basename "$BUNDLE_FILE")" | tee "$(basename "$BUNDLE_FILE").sha256"
+          )
+
+      - name: Upload native bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-native-linux-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/hermes-agent-native-${{ github.sha }}.tar.gz
+            ${{ runner.temp }}/hermes-agent-native-${{ github.sha }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
