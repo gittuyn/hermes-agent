@@ -21,6 +21,10 @@ requires_env:
     url: "https://open-dev.dingtalk.com"
     password: true
 optional_env:
+  - name: DINGTALK_ROBOT_CODE
+    description: "RobotCode for proactive OpenAPI delivery; defaults to Client ID when unset"
+    prompt: "DingTalk RobotCode (optional)"
+    password: false
   - name: DINGTALK_WEBHOOK_URL
     description: "Static robot webhook URL for cross-platform / cron delivery"
     prompt: "DingTalk robot webhook URL (optional)"

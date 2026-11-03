@@ -132,6 +132,37 @@ _NUMBERED_RE = re.compile(r"^\d+\.\s")
 _NO_LOCAL_UPLOAD = "DingTalk session webhook replies do not support local %s. Only markdown/text replies are supported without OpenAPI %s."
 
 
+async def _send_openapi_message(client, access_token: str, robot_code: str, chat_id: str, content: str,
+                                *, markdown: bool = False, user_id: Optional[str] = None) -> SendResult:
+    """Send a proactive robot message when no inbound session webhook is available."""
+    if str(chat_id).startswith("cid"):
+        endpoint = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+        target = {"openConversationId": chat_id}
+    else:
+        endpoint = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+        target = {"userIds": [user_id or chat_id]}
+    msg_param = {"title": "Hermes", "text": content} if markdown else {"content": content}
+    payload = {"robotCode": robot_code, "msgKey": "sampleMarkdown" if markdown else "sampleText",
+               "msgParam": json.dumps(msg_param, ensure_ascii=False), **target}
+    response = await client.post(endpoint, headers={"x-acs-dingtalk-access-token": access_token},
+                                 json=payload, timeout=15.0)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError:
+        try:
+            error_data = response.json()
+        except (ValueError, UnicodeDecodeError):
+            error_data = {}
+        error_code = error_data.get("code") or error_data.get("errcode") or "unknown"
+        if error_code == "resource.not.found":
+            return SendResult(success=False, error="DingTalk robot was not found. Set DINGTALK_ROBOT_CODE to the RobotCode shown under the app's Robot and Message Push settings.")
+        error_message = error_data.get("message") or error_data.get("errmsg") or "request rejected"
+        return SendResult(success=False, error=f"DingTalk API HTTP {response.status_code} ({error_code}): {error_message}")
+    data = response.json()
+    if data.get("errcode", 0) != 0:
+        return SendResult(success=False, error=f"DingTalk API error: {data.get('errmsg', 'unknown')}")
+    return SendResult(success=True, message_id=data.get("processQueryKey") or uuid.uuid4().hex[:12])
+
 def _csv_set(raw: Any) -> set[str]:
     """Split a list, JSON-list string or comma-separated string into a set of stripped, non-empty items."""
     raw = _decode_json_list_literal(raw)
@@ -211,7 +242,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._mention_patterns: list[re.Pattern] = self._compile_mention_patterns()
         self._allowed_users: set[str] = {item.lower() for item in self._csv_setting("allowed_users", "DINGTALK_ALLOWED_USERS")}
         self._stream_client = self._stream_task = self._http_client = self._card_sdk = self._robot_sdk = None
-        self._robot_code: str = extra.get("robot_code") or self._client_id
+        self._robot_code: str = extra.get("robot_code") or _get_scoped_secret("DINGTALK_ROBOT_CODE", "") or self._client_id
         self._dedup = MessageDeduplicator(max_size=1000)
         self._session_webhooks: dict[str, tuple[str, int]] = {}  # chat_id -> (webhook, expired_time_ms)
         self._message_contexts: dict[str, Any] = {}  # chat_id -> last inbound ChatbotMessage (per-chat: no clobber)
@@ -505,9 +536,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         metadata = metadata or {}
         logger.debug("[%s] send() chat_id=%s card_enabled=%s", self.name, chat_id, bool(self._card_template_id and self._card_sdk))
         session_webhook = metadata.get("session_webhook") or (self._get_valid_webhook(chat_id) or ("",))[0]
-        if not session_webhook:
-            logger.warning("[%s] No valid session_webhook for chat_id=%s", self.name, chat_id)
-            return SendResult(success=False, error="No valid session_webhook available. Reply must follow an incoming message.")
         if not self._http_client:
             return SendResult(success=False, error="HTTP client not initialized")
         current_message = self._message_contexts.get(chat_id)
@@ -524,7 +552,26 @@ class DingTalkAdapter(BasePlatformAdapter):
                 else:  # keep open + track so the next send() auto-closes it, or edit_message(finalize=True) does
                     self._streaming_cards.setdefault(chat_id, {})[result.message_id] = content
                 return result
-            logger.warning("[%s] AI Card send failed, falling back to webhook", self.name)
+            logger.warning("[%s] AI Card send failed, falling back to webhook/OpenAPI", self.name)
+        if not session_webhook:
+            access_token = await self._get_access_token()
+            if not access_token:
+                logger.warning("[%s] No session webhook or OpenAPI access token for chat_id=%s", self.name, chat_id)
+                return SendResult(success=False, error="No session webhook or OpenAPI access token available.")
+            try:
+                result = await _send_openapi_message(
+                    self._http_client, access_token, self._robot_code, chat_id,
+                    content[: self.MAX_MESSAGE_LENGTH], markdown=True,
+                    user_id=getattr(current_message, "sender_staff_id", None) if current_message else None,
+                )
+                if result.success and is_final_reply:
+                    self._fire_done_reaction(chat_id)
+                return result
+            except httpx.TimeoutException:
+                return SendResult(success=False, error="Timeout sending message to DingTalk")
+            except Exception as e:
+                logger.error("[%s] OpenAPI send error: %s", self.name, e)
+                return SendResult(success=False, error=str(e))
         logger.debug("[%s] Sending via webhook", self.name)
         payload = {"msgtype": "markdown", "markdown": {"title": "Hermes", "text": self._normalize_markdown(content[: self.MAX_MESSAGE_LENGTH])}}
         try:
@@ -670,7 +717,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         token = await self._get_access_token()
         if not token:
             return
-        robot_code = getattr(message, "robot_code", None) or self._client_id
+        robot_code = getattr(message, "robot_code", None) or self._robot_code
         pairs = [(getattr(obj, key, None) if hasattr(obj, key) else obj.get(key), obj, key) for obj, key in collect_download_codes(message)]
         tasks = [self._fetch_download_url(code, robot_code, token, obj, key) for code, obj, key in pairs if code]
         if tasks:
@@ -748,27 +795,43 @@ class _IncomingHandler(dingtalk_stream.ChatbotHandler if DINGTALK_STREAM_AVAILAB
 
 
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
-    """Out-of-process delivery (standalone_sender_fn) via the static robot webhook (DINGTALK_WEBHOOK_URL / extra
-    ``webhook_url``) — per-session webhooks aren't available to cron jobs."""
+    """Out-of-process delivery through a static webhook or the app's robot OpenAPI."""
     try:
         import httpx
     except ImportError:
         return send_error("httpx not installed")
-    # Scoped: the webhook URL carries the robot's access_token and IS the delivery target — a raw
-    # environ read would post a secondary profile's cron output to the default profile's robot.
-    webhook_url = (getattr(pconfig, "extra", {}) or {}).get("webhook_url") or _get_scoped_secret("DINGTALK_WEBHOOK_URL", "")
-    if not webhook_url:
-        return send_error("DingTalk not configured. Set DINGTALK_WEBHOOK_URL env var or webhook_url in dingtalk platform extra config.")
+    extra = getattr(pconfig, "extra", {}) or {}
+    # Scoped credentials and webhook must stay within this profile.
+    webhook_url = extra.get("webhook_url") or _get_scoped_secret("DINGTALK_WEBHOOK_URL", "")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(webhook_url, json={"msgtype": "text", "text": {"content": message}})
-            resp.raise_for_status()
-            data = resp.json()
-        if data.get("errcode", 0) != 0:
-            return send_error(f"DingTalk API error: {data.get('errmsg', 'unknown')}")
+            if webhook_url:
+                resp = await client.post(webhook_url, json={"msgtype": "text", "text": {"content": message}})
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("errcode", 0) != 0:
+                    return send_error(f"DingTalk API error: {data.get('errmsg', 'unknown')}")
+            else:
+                client_id, client_secret = _credentials(extra)
+                if not client_id or not client_secret:
+                    return send_error("DingTalk app credentials are required for OpenAPI delivery.")
+                robot_code = extra.get("robot_code") or _get_scoped_secret("DINGTALK_ROBOT_CODE", "") or client_id
+                if not chat_id:
+                    return send_error("A DingTalk conversation or user ID is required for OpenAPI delivery.")
+                token_resp = await client.post(
+                    "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+                    json={"appKey": client_id, "appSecret": client_secret},
+                )
+                token_resp.raise_for_status()
+                access_token = token_resp.json().get("accessToken")
+                if not access_token:
+                    return send_error("DingTalk did not return an access token.")
+                result = await _send_openapi_message(client, access_token, robot_code, chat_id, message)
+                if not result.success:
+                    return send_error(result.error or "DingTalk API error")
         return {"success": True, "platform": "dingtalk", "chat_id": chat_id}
     except Exception as e:
-        try:  # send_message_tool._error redacts access_token from webhook URLs (lazy import avoids a circular)
+        try:  # send_message_tool._error redacts access_token from webhook URLs.
             from tools.send_message_tool import _error as _redact_error
             return _redact_error(f"DingTalk send failed: {e}")
         except Exception:
