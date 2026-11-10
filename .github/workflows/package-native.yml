@@ -57,7 +57,7 @@ jobs:
       - name: Install Python 3.14 and locked dependencies
         run: |
           uv python install 3.14
-          uv sync --locked --python 3.14 --extra dev
+          uv sync --locked --python 3.14
 
       - name: Smoke test the built checkout
         run: |
