@@ -35,16 +35,15 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 26
-          cache: npm
 
-      - name: Use npm 12
-        run: npm i -g npm@12
+      - name: Install pinned pnpm
+        run: npm install -g pnpm@$(node -p "require('./pm/lock.json').packages.pnpm.version")
 
       - name: Install JavaScript dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Build Web UI
-        run: npm run --prefix web build
+        run: pnpm --filter web build
 
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
@@ -55,10 +54,10 @@ jobs:
             pyproject.toml
             uv.lock
 
-      - name: Install Python 3.11 and locked dependencies
+      - name: Install Python 3.14 and locked dependencies
         run: |
-          uv python install 3.11
-          uv sync --locked --python 3.11 --extra dev
+          uv python install 3.14
+          uv sync --locked --python 3.14 --extra dev
 
       - name: Smoke test the built checkout
         run: |
@@ -78,7 +77,7 @@ jobs:
           cp -a hermes_cli/web_dist "$BUNDLE_ROOT/hermes-agent/hermes_cli/"
           printf '%s\n' "$GITHUB_SHA" > "$BUNDLE_ROOT/hermes-agent/BUILD_SHA"
           printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BUNDLE_ROOT/hermes-agent/BUILD_TIME_UTC"
-          printf '{"commit":"%s","platform":"linux-x86_64","python":"3.11"}\n' \
+          printf '{"commit":"%s","platform":"linux-x86_64","python":"3.14"}\n' \
             "$GITHUB_SHA" > "$BUNDLE_ROOT/hermes-agent/bundle-manifest.json"
           tar -C "$BUNDLE_ROOT" -czf "$BUNDLE_FILE" hermes-agent
           (
